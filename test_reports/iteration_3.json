@@ -1,0 +1,68 @@
+{
+  "summary": "Backend-only testing of iteration-3 features (Login Guard 5-strike lockout, Notice-to-Seller via Resend/Twilio, Bulk URL Scan) plus full regression of the existing suite. Added /app/backend/tests/test_new_features.py (26 tests) and hardened conftest/test_health_auth so suite-internal bad-password tests no longer lock the shared seeded admin. Final: 72 passed, 5 xfailed, 0 failed (stable across 3 consecutive runs). All four new features work correctly at the application layer (verified both via REACT_APP_BACKEND_URL and directly on localhost:8001). The single blocking defect is that every 502 error body is replaced by a Cloudflare 'Bad gateway' HTML page at the preview ingress, so the clear provider error messages ('API key is invalid', Twilio trial error, URL-scan errors) never reach the browser.",
+  "backend_issues": {
+    "critical": [
+      {
+        "endpoint": "POST /api/scans/{scan_id}/send-notice, POST /api/scan/url",
+        "issue": "All failure paths return HTTP 502 and the ingress DISCARDS the FastAPI JSON body, returning content-type text/html with a Cloudflare '502: Bad gateway' page. Verified: internal call (http://localhost:8001) returns proper JSON {'detail': {'message':'All delivery attempts failed','errors':[{'channel':'email','error':'Email delivery failed: API key is invalid'}]}} while the same call through REACT_APP_BACKEND_URL returns HTML. Consequence: the UI can never display why the notice/URL scan failed (r.json() throws). Same defect was raised in iteration_2 for /scan/analyze and is still unfixed. Fix: return 422 (or 400/409) instead of 502 for upstream-provider and scrape failures.",
+        "priority": "CRITICAL"
+      }
+    ],
+    "minor": [
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "No rolling window / no counter reset when the lockout expires. Reproduced: with failures=5 and locked_until in the past, the correct password succeeds, BUT a single further wrong password immediately re-locks the account for another 15 minutes (failures becomes 6 >= threshold). Reset failures to 0 once locked_until has elapsed, or expire the counter after N minutes."
+      },
+      {
+        "endpoint": "POST /api/auth/login",
+        "issue": "login_attempts rows are also created for e-mails that do not exist as users, so db.login_attempts grows unboundedly and is never pruned. Add a TTL index on last_failed_at (or only track known accounts)."
+      },
+      {
+        "endpoint": "POST /api/scan/url",
+        "issue": "Endpoint uses get_current_user_optional, i.e. it is fully public. Any anonymous caller can trigger outbound scraping + a Gemini call (cost/SSRF surface). Require auth and/or rate-limit; also block internal/loopback hosts."
+      },
+      {
+        "endpoint": "POST /api/scans/{scan_id}/send-notice",
+        "issue": "With channel='both', if only one channel succeeds the endpoint returns 200, persists the notice and sets enforcement_notice_issued=true while errors[] contains the failed channel. Response is structured, but the partial failure must be surfaced explicitly (e.g. status='partially_delivered') so officers are not misled."
+      },
+      {
+        "endpoint": "POST /api/scan/url (BigBasket)",
+        "issue": "Informational, not a code bug: https://www.bigbasket.com/pd/40133761/parle-marie-biscuit-250-g/ actually serves a different product ('DP Silicone Rolling Pin/Belan'); the scanner faithfully extracted THAT product. The endpoint returned 200 with listing_platform='BigBasket', compliance_status, score, violations and declarations (net_quantity 1 pieces, MRP 269 incl. taxes)."
+      }
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/test_new_features.py",
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_health_auth.py",
+    "/app/test_reports/pytest/pytest_results_iter3.xml"
+  ],
+  "action_items": [
+    "CRITICAL: stop using 502 for provider/scrape failures on /scans/{id}/send-notice and /scan/url (and /scan/analyze) — the preview ingress strips the JSON body and serves a Cloudflare HTML 502. Use 422 so the frontend can show 'API key is invalid' / Twilio / 'blocked by anti-bot' messages; also make the frontend tolerate a non-JSON error body.",
+    "Reset the login failure counter when the 15-minute lockout window elapses (currently one more typo re-locks instantly for 15 min).",
+    "Add a TTL index / cleanup for db.login_attempts (rows created even for unknown e-mails).",
+    "Require authentication (and basic rate limiting + private-IP blocking) on POST /api/scan/url.",
+    "Provide a working RESEND_API_KEY and a Twilio-verified destination number so the success path (enforcement_notice_issued=true, latest_notice_number, db.notices document) can actually be exercised — it is currently UNVERIFIED because both providers fail by design.",
+    "Split server.py (956 lines) into routers (auth, scans, notices, url_scan, reports, dashboard)."
+  ],
+  "critical_code_review_comments": [
+    "server.py /auth/login: `update` never clears `locked_until`/`failures` after expiry — the lock document is only deleted on a successful login, giving the sticky-lockout behaviour described above.",
+    "server.py send_seller_notice: correct — the notice document is inserted and the scan flagged ONLY when at least one delivery succeeds; verified that a failed email leaves scan.latest_notice_number and db.notices untouched.",
+    "url_scan_service.fetch_product_page_text: no host allowlist/deny of private IPs before httpx.get on a user-supplied URL (SSRF risk), and the 12k-char cap plus <200-char sparse check are the only guards.",
+    "server.py /scan/url hardcodes panel_area=200 and default 3.0/2.0 mm heights, so Table-II font checks on URL scans are synthetic and will always 'pass' — mark them 'Not Applicable' for e-commerce listings instead of feeding fabricated measurements into the compliance score.",
+    "server.py: `from datetime import timedelta` imported inside the endpoint body — move to module imports."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_new_features.py (new: login guard, notice-to-seller, URL scan, regression, internal error-contract RCA tests)",
+    "/app/backend/tests/conftest.py (added clear_login_lockout() helper; admin_token now clears lockout before login)",
+    "/app/backend/tests/test_health_auth.py (brute-force test now uses a throwaway e-mail and asserts real 429 lockout; unknown-email test clears its lockout row)"
+  ],
+  "success_rate": {"backend": "100% (72 passed, 5 xfailed documenting the ingress 502-body defect and the sticky lockout counter)", "frontend": "not tested (backend-only request)"},
+  "seed_data_creation": "Temporary users test_lockguard_*@metrology.gov.in and test_bruteforce_*@metrology.gov.in created via /api/auth/register and deleted in fixture teardown; db.login_attempts rows for those e-mails removed. Verified after the run: users=4 (seeded only), no stray TEST_ users, db.notices still absent (no notice ever delivered).",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "admin@metrology.gov.in / AdminMetrology@2026 (unlocked; db.login_attempts cleared)",
+  "context_for_next_testing_agent": "Run `cd /app/backend && python -m pytest tests/ -q` (xdist -n 2 from pytest.ini). New module: tests/test_new_features.py with classes TestLoginGuard (throwaway account so admin is never locked), TestNoticeToSeller, TestUrlScan, TestRegression and TestInternalErrorContract (hits http://localhost:8001 to prove the FastAPI error JSON is correct and the HTML 502 comes from the edge). The 5 xfails are: 4x 'ingress replaced 502 JSON with HTML' (email notice, sms notice, anti-bot URL, unreachable domain) and 1x sticky lockout counter. IMPORTANT: any test that submits wrong passwords must call conftest.clear_login_lockout(email) in teardown, otherwise the shared admin gets locked for 15 minutes and every other class errors at the admin_token fixture. Once the 502->422 change lands, the 4 ingress xfails should convert to passes with readable JSON details. The notice SUCCESS path (db.notices persistence) is still unverified — needs a valid Resend key or a Twilio-verified number.",
+  "rca_of_the_issue": "Ingress 502: FastAPI raises HTTPException(502) with a JSON detail; the Kubernetes/Cloudflare preview edge treats any 502 from the upstream as a gateway failure and substitutes its own text/html error page, so requests.json() raises JSONDecodeError and the browser sees no message. Proven by comparing the same request against http://localhost:8001/api (application/json, full detail) vs REACT_APP_BACKEND_URL (text/html Cloudflare page). Mitigation: return a 4xx status (422) for upstream-provider/scrape failures. Sticky lockout: /auth/login only deletes the login_attempts document on a successful login; when locked_until expires the document still holds failures=5, so the next failed attempt increments to 6, re-triggering the >=5 lockout branch — reproduced by setting locked_until to the past and sending one wrong password (subsequent correct password returned 429)."
+}

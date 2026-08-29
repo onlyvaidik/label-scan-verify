@@ -59,8 +59,27 @@ def api_client():
     return session
 
 
+def clear_login_lockout(email):
+    """Remove brute-force lockout rows so suite-internal bad-password tests cannot
+    lock the shared seeded accounts for subsequent test classes."""
+    try:
+        from pymongo import MongoClient
+
+        backend_env = dotenv_values("/app/backend/.env")
+        mongo_url = os.environ.get("MONGO_URL") or backend_env.get("MONGO_URL")
+        db_name = os.environ.get("DB_NAME") or backend_env.get("DB_NAME")
+        if not (mongo_url and db_name):
+            return
+        client = MongoClient(mongo_url, serverSelectionTimeoutMS=5000)
+        client[db_name].login_attempts.delete_many({"email": email.strip().lower()})
+        client.close()
+    except Exception:
+        pass
+
+
 @pytest.fixture(scope="class")
 def admin_token(api_client, admin_credentials):
+    clear_login_lockout(admin_credentials["email"])
     r = api_client.post(
         f"{API}/auth/login",
         json={"email": admin_credentials["email"], "password": admin_credentials["password"]},

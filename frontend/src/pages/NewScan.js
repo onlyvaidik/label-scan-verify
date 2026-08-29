@@ -9,7 +9,11 @@ export default function NewScan() {
   const { user } = useAuth();
   const navigate = useNavigate();
   const fileInputRef = useRef(null);
+  const videoRef = useRef(null);
+  const canvasRef = useRef(null);
+  const streamRef = useRef(null);
 
+  const [scanMode, setScanMode] = useState("upload"); // "upload" | "camera" | "url"
   const [samples, setSamples] = useState([]);
   const [selectedImage, setSelectedImage] = useState(null);
   const [imagePreview, setImagePreview] = useState("");
@@ -19,6 +23,13 @@ export default function NewScan() {
   const [loading, setLoading] = useState(false);
   const [progressStep, setProgressStep] = useState(0);
   const [error, setError] = useState("");
+
+  // Camera state
+  const [cameraActive, setCameraActive] = useState(false);
+  const [cameraError, setCameraError] = useState("");
+
+  // URL scan state
+  const [productUrl, setProductUrl] = useState("");
 
   useEffect(() => {
     fetchSamples();
@@ -52,6 +63,89 @@ export default function NewScan() {
     setCategory(sample.category);
     setPanelArea(sample.panel_area_sq_cm || 140.0);
     setError("");
+  };
+
+  // ========== CAMERA LIVE SCAN ==========
+  const startCamera = async () => {
+    setCameraError("");
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: "environment" }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false
+      });
+      streamRef.current = stream;
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream;
+        await videoRef.current.play();
+      }
+      setCameraActive(true);
+    } catch (e) {
+      setCameraError(e.message || "Unable to access the camera. Ensure browser permission is granted.");
+    }
+  };
+
+  const stopCamera = () => {
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach((t) => t.stop());
+      streamRef.current = null;
+    }
+    setCameraActive(false);
+  };
+
+  const captureFromCamera = () => {
+    if (!videoRef.current || !canvasRef.current) return;
+    const video = videoRef.current;
+    const canvas = canvasRef.current;
+    canvas.width = video.videoWidth || 1280;
+    canvas.height = video.videoHeight || 720;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const dataUrl = canvas.toDataURL("image/jpeg", 0.85);
+    setSelectedImage(dataUrl);
+    setImagePreview(dataUrl);
+    stopCamera();
+  };
+
+  useEffect(() => {
+    return () => stopCamera();
+    // eslint-disable-next-line
+  }, []);
+
+  useEffect(() => {
+    if (scanMode !== "camera") stopCamera();
+    // eslint-disable-next-line
+  }, [scanMode]);
+
+  // ========== URL SCAN ==========
+  const handleUrlScan = async () => {
+    if (!productUrl.trim()) {
+      setError("Please paste a valid product listing URL.");
+      return;
+    }
+    setError("");
+    setLoading(true);
+    setProgressStep(1);
+    try {
+      setTimeout(() => setProgressStep(2), 500);
+      setTimeout(() => setProgressStep(3), 1200);
+      setTimeout(() => setProgressStep(4), 2000);
+
+      const res = await axios.post(
+        `${BACKEND_URL}/api/scan/url`,
+        { url: productUrl.trim(), category: category },
+        { withCredentials: true, timeout: 90000 }
+      );
+      sessionStorage.setItem("current_scan_data", JSON.stringify({
+        ...res.data,
+        image_url: "https://images.unsplash.com/photo-1607083206325-caf1edba7a83?w=600&auto=format&fit=crop&q=80"
+      }));
+      navigate("/scan-review");
+    } catch (err) {
+      const d = err.response?.data?.detail;
+      setError(typeof d === "string" ? d : (d?.message || "URL scanning failed. The site may block automated fetching."));
+    } finally {
+      setLoading(false);
+    }
   };
 
   const handleStartAnalysis = async () => {
@@ -138,7 +232,33 @@ export default function NewScan() {
         </div>
       )}
 
-      {/* Sample Pre-loaded Products (For Instant One-Click Testing) */}
+      {/* Scan Mode Selector */}
+      <div className="bg-white rounded-2xl p-2 border border-gray-100 shadow-sm">
+        <div className="grid grid-cols-3 gap-1">
+          {[
+            { v: "upload", l: "Image Upload", i: "upload_file" },
+            { v: "camera", l: "Live Camera Scan", i: "photo_camera" },
+            { v: "url", l: "E-commerce URL", i: "link" }
+          ].map((m) => (
+            <button
+              key={m.v}
+              data-testid={`scan-mode-${m.v}`}
+              onClick={() => { setScanMode(m.v); setError(""); }}
+              className={`px-4 py-2.5 rounded-xl text-xs font-bold flex items-center justify-center gap-2 transition-all ${
+                scanMode === m.v
+                  ? "bg-[#001255] text-white shadow-md"
+                  : "text-gray-600 hover:bg-gray-50"
+              }`}
+            >
+              <span className="material-symbols-outlined text-lg">{m.i}</span>
+              <span>{m.l}</span>
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Sample Pre-loaded Products (only for Upload mode) */}
+      {scanMode === "upload" && (
       <div className="bg-white rounded-2xl p-6 border border-gray-100 shadow-sm">
         <div className="flex items-center justify-between mb-4">
           <div>
@@ -186,8 +306,213 @@ export default function NewScan() {
           ))}
         </div>
       </div>
+      )}
 
-      {/* Main Upload & Parameters Grid */}
+      {/* URL SCAN MODE */}
+      {scanMode === "url" && (
+        <div className="bg-white rounded-2xl p-6 border border-gray-100 shadow-sm space-y-4">
+          <div>
+            <h2 className="text-base font-bold text-[#001255] flex items-center gap-2">
+              <span className="material-symbols-outlined text-blue-600">link</span>
+              <span>E-commerce Product Listing Scanner</span>
+            </h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Paste a product listing URL (BigBasket, Nykaa, Meesho, Blinkit, Zepto, official brand pages). Amazon and Flipkart typically block automated scraping.
+            </p>
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+              Product Listing URL
+            </label>
+            <input
+              type="url"
+              data-testid="url-input"
+              value={productUrl}
+              onChange={(e) => setProductUrl(e.target.value)}
+              placeholder="https://www.bigbasket.com/pd/..."
+              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-[#001255]"
+            />
+          </div>
+
+          <div>
+            <label className="block text-xs font-bold text-gray-700 uppercase tracking-wider mb-1.5">
+              Regulatory Commodity Category
+            </label>
+            <select
+              data-testid="url-category-select"
+              value={category}
+              onChange={(e) => setCategory(e.target.value)}
+              className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3.5 py-2.5 text-sm text-gray-900 focus:outline-none focus:border-[#001255]"
+            >
+              <option value="FMCG Packaged Food">FMCG Packaged Food</option>
+              <option value="Cosmetics & Personal Care">Cosmetics & Personal Care</option>
+              <option value="Electronics & Appliances">Electronics & Appliances</option>
+              <option value="Household Goods">Household Goods</option>
+              <option value="Pharmaceuticals & Wellness">Pharmaceuticals & Wellness</option>
+            </select>
+          </div>
+
+          <button
+            type="button"
+            disabled={loading}
+            data-testid="url-scan-btn"
+            onClick={handleUrlScan}
+            className="w-full bg-[#001255] hover:bg-[#1a2f70] active:scale-[0.99] text-white font-bold py-3.5 rounded-xl shadow-lg transition-all flex items-center justify-center gap-2 text-sm disabled:opacity-50"
+          >
+            {loading ? (
+              <>
+                <span className="material-symbols-outlined animate-spin text-xl">progress_activity</span>
+                <span>
+                  {progressStep === 1 && "Fetching listing content..."}
+                  {progressStep === 2 && "Extracting Rule 6 declarations..."}
+                  {progressStep === 3 && "Evaluating LMPC compliance..."}
+                  {progressStep === 4 && "Compiling violation report..."}
+                </span>
+              </>
+            ) : (
+              <>
+                <span className="material-symbols-outlined text-xl">travel_explore</span>
+                <span>Scan Listing for LMPC Compliance</span>
+              </>
+            )}
+          </button>
+
+          <div className="bg-blue-50/60 rounded-xl p-4 border border-blue-100 text-xs text-gray-700">
+            <p className="font-bold text-[#001255] mb-1 flex items-center gap-1.5">
+              <span className="material-symbols-outlined text-sm">info</span>
+              What we check:
+            </p>
+            <ul className="list-disc list-inside space-y-0.5 text-[11px] text-gray-600">
+              <li>Country of Origin (mandatory for e-commerce under LMPC Rules 2011)</li>
+              <li>MRP with "inclusive of all taxes" disclosure</li>
+              <li>Net quantity in SI units (g, ml, kg, l, N)</li>
+              <li>Manufacturer/Packer/Importer name and complete address</li>
+              <li>Consumer care contact and manufacturing month/year</li>
+            </ul>
+          </div>
+        </div>
+      )}
+
+      {/* CAMERA MODE */}
+      {scanMode === "camera" && (
+        <div className="bg-white rounded-2xl p-6 border border-gray-100 shadow-sm space-y-4">
+          <div>
+            <h2 className="text-base font-bold text-[#001255] flex items-center gap-2">
+              <span className="material-symbols-outlined text-red-600">photo_camera</span>
+              <span>Live Camera Scanner (Field Inspector Mode)</span>
+            </h2>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Snap a package with your device's rear camera and instantly grade it. Works on mobile and desktop with a webcam.
+            </p>
+          </div>
+
+          {cameraError && (
+            <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs">
+              {cameraError}
+            </div>
+          )}
+
+          <div className="relative w-full aspect-video rounded-xl overflow-hidden bg-gray-900 border border-gray-300 flex items-center justify-center">
+            {imagePreview && !cameraActive ? (
+              <img src={imagePreview} alt="Captured" className="max-h-full max-w-full object-contain" />
+            ) : (
+              <>
+                <video
+                  ref={videoRef}
+                  data-testid="camera-video"
+                  playsInline
+                  muted
+                  className={`w-full h-full object-cover ${cameraActive ? "" : "hidden"}`}
+                />
+                {!cameraActive && (
+                  <div className="text-white/70 text-center">
+                    <span className="material-symbols-outlined text-6xl mb-2 block">videocam_off</span>
+                    <span className="text-xs">Camera is off. Click "Start Camera" to begin.</span>
+                  </div>
+                )}
+                {cameraActive && (
+                  <div className="absolute inset-4 border-2 border-amber-400/70 rounded-xl pointer-events-none">
+                    <div className="absolute top-2 left-2 text-amber-400 text-[10px] font-mono bg-black/50 px-2 py-0.5 rounded">
+                      • LIVE • Aim at PDP with MRP + Net Qty in frame
+                    </div>
+                  </div>
+                )}
+              </>
+            )}
+            <canvas ref={canvasRef} className="hidden" />
+          </div>
+
+          <div className="flex flex-wrap gap-2">
+            {!cameraActive && !imagePreview && (
+              <button
+                type="button"
+                data-testid="start-camera-btn"
+                onClick={startCamera}
+                className="flex-1 bg-[#001255] hover:bg-[#1a2f70] text-white font-bold py-2.5 rounded-xl text-sm flex items-center justify-center gap-2"
+              >
+                <span className="material-symbols-outlined">videocam</span>
+                <span>Start Camera</span>
+              </button>
+            )}
+            {cameraActive && (
+              <>
+                <button
+                  type="button"
+                  data-testid="capture-camera-btn"
+                  onClick={captureFromCamera}
+                  className="flex-1 bg-[#E88A1E] hover:bg-[#d47b15] text-white font-bold py-2.5 rounded-xl text-sm flex items-center justify-center gap-2 shadow-lg"
+                >
+                  <span className="material-symbols-outlined">camera</span>
+                  <span>Capture & Grade</span>
+                </button>
+                <button
+                  type="button"
+                  data-testid="stop-camera-btn"
+                  onClick={stopCamera}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 px-4 rounded-xl text-sm"
+                >
+                  Stop
+                </button>
+              </>
+            )}
+            {!cameraActive && imagePreview && (
+              <>
+                <button
+                  type="button"
+                  data-testid="camera-retake-btn"
+                  onClick={() => { setImagePreview(""); setSelectedImage(null); startCamera(); }}
+                  className="bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 px-4 rounded-xl text-sm"
+                >
+                  Retake
+                </button>
+                <button
+                  type="button"
+                  disabled={loading}
+                  data-testid="camera-analyze-btn"
+                  onClick={handleStartAnalysis}
+                  className="flex-1 bg-[#E88A1E] hover:bg-[#d47b15] text-white font-bold py-2.5 rounded-xl text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                >
+                  {loading ? (
+                    <>
+                      <span className="material-symbols-outlined animate-spin">progress_activity</span>
+                      <span>Analyzing...</span>
+                    </>
+                  ) : (
+                    <>
+                      <span className="material-symbols-outlined">qr_code_scanner</span>
+                      <span>Grade this Snap</span>
+                    </>
+                  )}
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* Main Upload & Parameters Grid — only for Upload mode */}
+      {scanMode === "upload" && (
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column: Image Upload & Viewport (7 Cols) */}
         <div className="lg:col-span-7 space-y-4">
@@ -366,6 +691,7 @@ export default function NewScan() {
           </div>
         </div>
       </div>
+      )}
     </div>
   );
 }

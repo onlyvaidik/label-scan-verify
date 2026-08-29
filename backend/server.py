@@ -27,6 +27,10 @@ from compliance_engine import (
 from ai_vision_service import scan_label_with_ai_vision
 from report_generator import generate_pdf_report, generate_docx_report, export_scans_to_csv
 from seed_data import seed_initial_database, SAMPLE_PRODUCTS
+from notice_service import (
+    build_notice_html, build_notice_sms, send_email_notice, send_sms_notice
+)
+from url_scan_service import analyze_ecommerce_url
 
 logging.basicConfig(
     level=logging.INFO,
@@ -90,6 +94,17 @@ class ScanSaveRequest(BaseModel):
 class ScanActionRequest(BaseModel):
     action: str  # "issue_notice", "flag_lab_test", "mark_verified", "archive"
     notes: Optional[str] = None
+
+class SendNoticeRequest(BaseModel):
+    channel: str  # "email" | "sms" | "both"
+    recipient_email: Optional[str] = None
+    recipient_phone: Optional[str] = None
+    reply_deadline_days: int = 15
+    custom_message: Optional[str] = None
+
+class ScanUrlRequest(BaseModel):
+    url: str
+    category: Optional[str] = "FMCG Packaged Food"
 
 
 # ------------------ Auth Dependency ------------------
@@ -180,13 +195,52 @@ async def register_user(req: UserRegisterRequest, response: Response):
 @api_router.post("/auth/login")
 async def login_user(req: UserLoginRequest, response: Response, request: Request):
     email_clean = req.email.strip().lower()
+    
+    # 5-strike lockout guard: check if account is currently locked
+    LOCKOUT_THRESHOLD = 5
+    LOCKOUT_WINDOW_MINUTES = 15
+    now_ts = datetime.now(timezone.utc).timestamp()
+    lock_doc = await db.login_attempts.find_one({"email": email_clean})
+    
+    # Reset stale counters if the lockout window has already elapsed
+    if lock_doc and lock_doc.get("locked_until", 0) > 0 and lock_doc["locked_until"] <= now_ts:
+        await db.login_attempts.delete_one({"email": email_clean})
+        lock_doc = None
+    
+    if lock_doc and lock_doc.get("locked_until", 0) > now_ts:
+        seconds_left = int(lock_doc["locked_until"] - now_ts)
+        raise HTTPException(
+            status_code=429,
+            detail=f"Account temporarily locked due to {LOCKOUT_THRESHOLD} failed sign-in attempts. Try again in {seconds_left // 60}m {seconds_left % 60}s."
+        )
+    
     user = await db.users.find_one({"email": email_clean})
-    if not user:
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    if not user or not verify_password(req.password, user.get("password_hash", "")):
+        # Record failed attempt
+        failures = (lock_doc.get("failures", 0) if lock_doc else 0) + 1
+        update: Dict[str, Any] = {
+            "email": email_clean,
+            "failures": failures,
+            "last_failed_at": datetime.now(timezone.utc).isoformat(),
+            "last_failed_ip": request.client.host if request.client else "unknown"
+        }
+        if failures >= LOCKOUT_THRESHOLD:
+            update["locked_until"] = now_ts + (LOCKOUT_WINDOW_MINUTES * 60)
+            await log_audit_event(email_clean, "LOGIN_LOCKOUT", "USER", email_clean, {"failures": failures, "lock_minutes": LOCKOUT_WINDOW_MINUTES})
+        await db.login_attempts.update_one({"email": email_clean}, {"$set": update}, upsert=True)
         
-    if not verify_password(req.password, user.get("password_hash", "")):
-        raise HTTPException(status_code=401, detail="Invalid email or password.")
-        
+        remaining = max(0, LOCKOUT_THRESHOLD - failures)
+        detail = "Invalid email or password."
+        if failures >= LOCKOUT_THRESHOLD:
+            detail = f"Too many failed attempts. Account locked for {LOCKOUT_WINDOW_MINUTES} minutes."
+        elif remaining <= 2:
+            detail = f"Invalid email or password. {remaining} attempt(s) remaining before lockout."
+        raise HTTPException(status_code=401, detail=detail)
+    
+    # Success — clear failure counter
+    if lock_doc:
+        await db.login_attempts.delete_one({"email": email_clean})
+    
     user_id = str(user["_id"])
     
     # 2FA check
@@ -318,8 +372,9 @@ async def analyze_product_label(req: ScanAnalyzeRequest, user: Optional[dict] = 
     try:
         extracted = await scan_label_with_ai_vision(req.image_base64, req.product_hint)
     except RuntimeError as e:
-        # Vision AI failed (invalid image, API error, etc.) - fail loudly
-        raise HTTPException(status_code=502, detail=str(e))
+        # Vision AI failed (invalid image, API error, etc.) - fail loudly. 
+        # Use 422 (not 502) so the Cloudflare ingress does not replace body with an HTML gateway page.
+        raise HTTPException(status_code=422, detail=str(e))
     
     try:
         # Coerce None-values to safe numeric defaults (Gemini/GPT may return null for measured heights)
@@ -568,6 +623,163 @@ async def get_scan_json_report(scan_id: str):
     if not scan:
         raise HTTPException(status_code=404, detail="Inspection case not found")
     return scan
+
+
+# =======================================================
+#           NOTICE-TO-SELLER (Section 36)
+# =======================================================
+@api_router.post("/scans/{scan_id}/send-notice")
+async def send_seller_notice(scan_id: str, req: SendNoticeRequest, user: dict = Depends(get_current_user)):
+    """Sends a Section 36 statutory notice via email (Resend) and/or SMS (Twilio)."""
+    scan = await db.scans.find_one({"id": scan_id}, {"_id": 0})
+    if not scan:
+        raise HTTPException(status_code=404, detail="Inspection case not found")
+    
+    if req.channel not in ("email", "sms", "both"):
+        raise HTTPException(status_code=400, detail="Channel must be one of: email, sms, both")
+    
+    # Auto-pick recipient from declarations if not provided
+    decl = scan.get("declarations", {})
+    to_email = (req.recipient_email or decl.get("consumer_care_email") or "").strip()
+    to_phone = (req.recipient_phone or decl.get("consumer_care_phone") or "").strip()
+    
+    if req.channel in ("email", "both") and not to_email:
+        raise HTTPException(status_code=400, detail="Recipient email is required for email channel.")
+    if req.channel in ("sms", "both") and not to_phone:
+        raise HTTPException(status_code=400, detail="Recipient phone is required for SMS channel.")
+    
+    from datetime import timedelta
+    deadline_dt = datetime.now(timezone.utc) + timedelta(days=max(1, req.reply_deadline_days))
+    reply_deadline = deadline_dt.strftime("%d %B %Y")
+    notice_number = f"LM/SEC36/{datetime.now().year}/{uuid.uuid4().hex[:6].upper()}"
+    
+    delivery_results = []
+    errors = []
+    
+    if req.channel in ("email", "both"):
+        try:
+            html = build_notice_html(scan, reply_deadline, notice_number)
+            subject = f"Legal Metrology Statutory Notice {notice_number} — {scan.get('brand_name','Product')}"
+            result = await send_email_notice(to_email, subject, html)
+            delivery_results.append(result)
+        except Exception as e:
+            errors.append({"channel": "email", "error": str(e)})
+    
+    if req.channel in ("sms", "both"):
+        try:
+            body = req.custom_message or build_notice_sms(scan, reply_deadline, notice_number)
+            result = await send_sms_notice(to_phone, body)
+            delivery_results.append(result)
+        except Exception as e:
+            errors.append({"channel": "sms", "error": str(e)})
+    
+    if not delivery_results and errors:
+        # 422 (not 502) so Cloudflare ingress preserves our JSON body.
+        raise HTTPException(status_code=422, detail={"message": "All delivery attempts failed", "errors": errors})
+    
+    # Record notice in DB
+    notice_doc = {
+        "id": notice_number,
+        "scan_id": scan_id,
+        "notice_number": notice_number,
+        "issued_by_email": user["email"],
+        "issued_by_name": user.get("name", "Officer"),
+        "reply_deadline": reply_deadline,
+        "channels_attempted": req.channel,
+        "deliveries": delivery_results,
+        "errors": errors,
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.notices.insert_one(notice_doc)
+    
+    # Mark scan as notice-issued
+    await db.scans.update_one(
+        {"id": scan_id},
+        {"$set": {
+            "enforcement_notice_issued": True,
+            "notice_issued_at": datetime.now(timezone.utc).isoformat(),
+            "notice_issued_by": user.get("name", "Officer"),
+            "review_status": "Notice Issued under Sec 36",
+            "latest_notice_number": notice_number
+        }}
+    )
+    
+    await log_audit_event(user["email"], "SEND_SECTION_36_NOTICE", "SCAN", scan_id, {
+        "notice_number": notice_number, "channels": req.channel,
+        "success": len(delivery_results), "failed": len(errors)
+    })
+    
+    notice_doc.pop("_id", None)
+    return notice_doc
+
+
+@api_router.get("/scans/{scan_id}/notices")
+async def list_notices_for_scan(scan_id: str):
+    notices = await db.notices.find({"scan_id": scan_id}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    return notices
+
+
+# =======================================================
+#           BULK URL SCAN (e-commerce listings)
+# =======================================================
+@api_router.post("/scan/url")
+async def scan_ecommerce_url(req: ScanUrlRequest, user: Optional[dict] = Depends(get_current_user_optional)):
+    """Scan an e-commerce product listing URL (Amazon, Flipkart, Nykaa, etc.) for LMPC compliance."""
+    url = req.url.strip()
+    if not (url.startswith("http://") or url.startswith("https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+    
+    try:
+        extracted = await analyze_ecommerce_url(url)
+    except RuntimeError as e:
+        # 422 keeps the JSON body intact through the Cloudflare preview ingress.
+        raise HTTPException(status_code=422, detail=str(e))
+    
+    panel_area = 200.0  # E-commerce listings — assume large primary display panel
+    numeral_h = extracted.get("measured_numeral_height_mm") or 3.0
+    letter_h = extracted.get("measured_letter_height_mm") or 2.0
+    
+    declarations = {
+        "manufacturer_name": extracted.get("manufacturer_name", ""),
+        "manufacturer_address": extracted.get("manufacturer_address", ""),
+        "packer_name": extracted.get("packer_name"),
+        "importer_name": extracted.get("importer_name"),
+        "commodity_name": extracted.get("commodity_name", ""),
+        "net_quantity_value": extracted.get("net_quantity_value"),
+        "net_quantity_unit": extracted.get("net_quantity_unit", ""),
+        "net_quantity_raw": extracted.get("net_quantity_raw", ""),
+        "unit_sale_price": extracted.get("unit_sale_price", ""),
+        "mrp_value": extracted.get("mrp_value"),
+        "mrp_raw": extracted.get("mrp_raw", ""),
+        "taxes_inclusive_declared": extracted.get("taxes_inclusive_declared", False),
+        "manufacturing_date": extracted.get("manufacturing_date", ""),
+        "best_before_date": extracted.get("best_before_date", ""),
+        "consumer_care_phone": extracted.get("consumer_care_phone", ""),
+        "consumer_care_email": extracted.get("consumer_care_email", ""),
+        "consumer_care_details": extracted.get("consumer_care_details", ""),
+        "country_of_origin": extracted.get("country_of_origin", ""),
+        "batch_number": extracted.get("batch_number", "")
+    }
+    
+    compliance = validate_declarations_against_lmpc_rules(declarations, panel_area, numeral_h, letter_h)
+    
+    return {
+        "brand_name": extracted.get("brand_name", "E-commerce Listing"),
+        "commodity_name": declarations["commodity_name"] or "Online Product",
+        "category": req.category or "FMCG Packaged Food",
+        "barcode_gtin": extracted.get("barcode_gtin") or ("URL-" + str(uuid.uuid4().hex[:10]).upper()),
+        "listing_url": url,
+        "listing_platform": extracted.get("listing_platform"),
+        "engine_used": extracted.get("engine_used", "Gemini 3 Flash E-commerce Analyzer"),
+        "ocr_confidence": extracted.get("ocr_confidence", 92.0),
+        "panel_area_sq_cm": panel_area,
+        "numeral_height_mm": numeral_h,
+        "letter_height_mm": letter_h,
+        "declarations": declarations,
+        "ocr_raw_text": extracted.get("ocr_raw_text", ""),
+        "label_regions": [],
+        **compliance
+    }
 
 
 @api_router.get("/reports/export/csv")

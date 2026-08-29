@@ -58,6 +58,9 @@ class TestAuthLogin:
         assert "detail" in r.json()
 
     def test_login_unknown_email(self, api_client):
+        from conftest import clear_login_lockout
+
+        clear_login_lockout("TEST_nobody@metrology.gov.in")
         r = api_client.post(
             f"{API}/auth/login",
             json={"email": "TEST_nobody@metrology.gov.in", "password": "whatever"},
@@ -65,19 +68,29 @@ class TestAuthLogin:
         )
         assert r.status_code == 401
 
-    def test_brute_force_lockout_behaviour(self, api_client, admin_credentials):
-        """Informational: 6 consecutive bad logins should ideally trigger lockout (429/423)."""
+    def test_brute_force_lockout_behaviour(self, api_client):
+        """5 consecutive bad logins must lock the account; the 6th must return 429.
+        Uses a throwaway email so the shared seeded admin is never locked (and so parallel
+        workers logging in as admin cannot race with this sequence)."""
+        import uuid
+
+        from conftest import clear_login_lockout
+
+        email = f"test_bruteforce_{uuid.uuid4().hex[:8]}@metrology.gov.in"
+        clear_login_lockout(email)
         statuses = []
-        for _ in range(6):
-            r = api_client.post(
-                f"{API}/auth/login",
-                json={"email": admin_credentials["email"], "password": "BadPass!000"},
-                timeout=60,
-            )
-            statuses.append(r.status_code)
-        assert all(s in (401, 423, 429) for s in statuses), statuses
-        if statuses[-1] == 401:
-            pytest.xfail(f"No brute-force lockout implemented; statuses={statuses}")
+        try:
+            for _ in range(6):
+                r = api_client.post(
+                    f"{API}/auth/login",
+                    json={"email": email, "password": "BadPass!000"},
+                    timeout=60,
+                )
+                statuses.append(r.status_code)
+            assert all(s in (401, 423, 429) for s in statuses), statuses
+            assert statuses[5] == 429, f"expected lockout on 6th attempt, got {statuses}"
+        finally:
+            clear_login_lockout(email)
 
 
 class TestAuthMe:

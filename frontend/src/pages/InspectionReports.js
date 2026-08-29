@@ -22,6 +22,16 @@ export default function InspectionReports() {
   const [selectedScan, setSelectedScan] = useState(null);
   const [actionNotes, setActionNotes] = useState("");
   const [actionLoading, setActionLoading] = useState(false);
+  
+  // Send Notice Modal
+  const [showNoticeModal, setShowNoticeModal] = useState(false);
+  const [noticeChannel, setNoticeChannel] = useState("email");
+  const [noticeEmail, setNoticeEmail] = useState("");
+  const [noticePhone, setNoticePhone] = useState("");
+  const [noticeDeadlineDays, setNoticeDeadlineDays] = useState(15);
+  const [noticeSending, setNoticeSending] = useState(false);
+  const [noticeResult, setNoticeResult] = useState(null);
+  const [noticeError, setNoticeError] = useState("");
 
   useEffect(() => {
     fetchScans();
@@ -86,6 +96,44 @@ export default function InspectionReports() {
 
   const handleExportCSV = () => {
     window.open(`${BACKEND_URL}/api/reports/export/csv`, "_blank");
+  };
+
+  const openNoticeModal = () => {
+    if (!selectedScan) return;
+    setNoticeEmail(selectedScan.declarations?.consumer_care_email || "");
+    setNoticePhone(selectedScan.declarations?.consumer_care_phone || "");
+    setNoticeChannel("email");
+    setNoticeResult(null);
+    setNoticeError("");
+    setShowNoticeModal(true);
+  };
+
+  const handleSendNotice = async () => {
+    if (!selectedScan) return;
+    setNoticeSending(true);
+    setNoticeError("");
+    setNoticeResult(null);
+    try {
+      const payload = {
+        channel: noticeChannel,
+        reply_deadline_days: parseInt(noticeDeadlineDays) || 15
+      };
+      if (noticeChannel === "email" || noticeChannel === "both") payload.recipient_email = noticeEmail;
+      if (noticeChannel === "sms" || noticeChannel === "both") payload.recipient_phone = noticePhone;
+      const res = await axios.post(
+        `${BACKEND_URL}/api/scans/${selectedScan.id}/send-notice`,
+        payload,
+        { withCredentials: true }
+      );
+      setNoticeResult(res.data);
+      fetchSingleScan(selectedScan.id);
+      fetchScans();
+    } catch (e) {
+      const d = e.response?.data?.detail;
+      setNoticeError(typeof d === "string" ? d : (d?.message || "Failed to send notice."));
+    } finally {
+      setNoticeSending(false);
+    }
   };
 
   return (
@@ -382,6 +430,15 @@ export default function InspectionReports() {
                   />
                   <div className="flex flex-wrap gap-2">
                     <button
+                      onClick={openNoticeModal}
+                      disabled={actionLoading}
+                      data-testid="action-send-notice-btn"
+                      className="bg-red-700 hover:bg-red-800 text-white font-bold px-3 py-1.5 rounded-lg text-xs flex items-center gap-1"
+                    >
+                      <span className="material-symbols-outlined text-xs">forward_to_inbox</span>
+                      Send Notice (Email/SMS)
+                    </button>
+                    <button
                       onClick={() => handlePerformAction("issue_notice")}
                       disabled={actionLoading}
                       data-testid="action-issue-notice-btn"
@@ -444,6 +501,178 @@ export default function InspectionReports() {
                 Close
               </button>
             </div>
+          </div>
+        </div>
+      )}
+
+      {/* Send Notice Modal */}
+      {showNoticeModal && selectedScan && (
+        <div
+          data-testid="notice-modal"
+          className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4"
+        >
+          <div className="bg-white rounded-2xl w-full max-w-lg shadow-2xl p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-gray-200 pb-3">
+              <div>
+                <h3 className="text-base font-bold text-[#001255] flex items-center gap-2">
+                  <span className="material-symbols-outlined text-red-600">forward_to_inbox</span>
+                  <span>Serve Section 36 Notice</span>
+                </h3>
+                <p className="text-[11px] text-gray-500">Case: {selectedScan.id} • {selectedScan.brand_name}</p>
+              </div>
+              <button
+                onClick={() => setShowNoticeModal(false)}
+                data-testid="close-notice-modal-btn"
+                className="p-1 text-gray-400 hover:text-gray-700"
+              >
+                <span className="material-symbols-outlined">close</span>
+              </button>
+            </div>
+
+            {noticeResult ? (
+              <div className="space-y-3">
+                <div
+                  data-testid="notice-success-alert"
+                  className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-900 text-xs"
+                >
+                  <div className="flex items-center gap-2 font-bold mb-1">
+                    <span className="material-symbols-outlined text-base">check_circle</span>
+                    <span>Notice {noticeResult.notice_number} dispatched</span>
+                  </div>
+                  <p className="text-emerald-800 text-[11px]">Reply deadline: {noticeResult.reply_deadline}</p>
+                </div>
+
+                {noticeResult.deliveries?.map((d, i) => (
+                  <div key={i} className="p-2.5 bg-blue-50 border border-blue-100 rounded-lg text-[11px]">
+                    <b className="text-blue-900">{d.channel.toUpperCase()} via {d.provider}</b> — status:{" "}
+                    <span className="font-mono text-emerald-700">{d.status}</span> to <code>{d.recipient}</code>
+                    <div className="text-gray-500 text-[10px]">Msg ID: {d.provider_message_id}</div>
+                  </div>
+                ))}
+
+                {noticeResult.errors?.length > 0 && noticeResult.errors.map((err, i) => (
+                  <div key={i} className="p-2.5 bg-amber-50 border border-amber-200 rounded-lg text-[11px] text-amber-900">
+                    <b>{err.channel.toUpperCase()}</b> failed: {err.error}
+                  </div>
+                ))}
+
+                <button
+                  onClick={() => setShowNoticeModal(false)}
+                  data-testid="close-notice-success-btn"
+                  className="w-full bg-[#001255] hover:bg-[#1a2f70] text-white font-bold py-2.5 rounded-xl text-sm"
+                >
+                  Done
+                </button>
+              </div>
+            ) : (
+              <>
+                {noticeError && (
+                  <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-red-800 text-xs">
+                    {noticeError}
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-[11px] font-bold text-gray-600 uppercase mb-1.5">Channel</label>
+                  <div className="grid grid-cols-3 gap-2">
+                    {[
+                      { v: "email", l: "Email", i: "mail" },
+                      { v: "sms", l: "SMS", i: "sms" },
+                      { v: "both", l: "Both", i: "campaign" }
+                    ].map((c) => (
+                      <button
+                        key={c.v}
+                        type="button"
+                        data-testid={`notice-channel-${c.v}`}
+                        onClick={() => setNoticeChannel(c.v)}
+                        className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 border transition-all ${
+                          noticeChannel === c.v
+                            ? "bg-[#001255] text-white border-[#001255]"
+                            : "bg-white border-gray-200 text-gray-700 hover:border-blue-400"
+                        }`}
+                      >
+                        <span className="material-symbols-outlined text-sm">{c.i}</span>
+                        {c.l}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {(noticeChannel === "email" || noticeChannel === "both") && (
+                  <div>
+                    <label className="block text-[11px] font-bold text-gray-600 uppercase mb-1.5">Recipient Email</label>
+                    <input
+                      type="email"
+                      data-testid="notice-email-input"
+                      value={noticeEmail}
+                      onChange={(e) => setNoticeEmail(e.target.value)}
+                      placeholder="seller@company.com"
+                      className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm"
+                    />
+                  </div>
+                )}
+
+                {(noticeChannel === "sms" || noticeChannel === "both") && (
+                  <div>
+                    <label className="block text-[11px] font-bold text-gray-600 uppercase mb-1.5">Recipient Phone (E.164)</label>
+                    <input
+                      type="tel"
+                      data-testid="notice-phone-input"
+                      value={noticePhone}
+                      onChange={(e) => setNoticePhone(e.target.value)}
+                      placeholder="+919812345678"
+                      className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm"
+                    />
+                    <p className="text-[10px] text-gray-400 mt-1">Include country code. India: +91xxxxxxxxxx</p>
+                  </div>
+                )}
+
+                <div>
+                  <label className="block text-[11px] font-bold text-gray-600 uppercase mb-1.5">Reply Deadline (days)</label>
+                  <input
+                    type="number"
+                    min="1"
+                    max="90"
+                    data-testid="notice-deadline-input"
+                    value={noticeDeadlineDays}
+                    onChange={(e) => setNoticeDeadlineDays(e.target.value)}
+                    className="w-full bg-gray-50 border border-gray-200 rounded-xl px-3 py-2 text-sm"
+                  />
+                </div>
+
+                <div className="p-2.5 bg-amber-50/60 border border-amber-200 rounded-lg text-[11px] text-amber-900">
+                  <b>The notice will include:</b> case ID, all detected violations, remedy directions,
+                  Section 36 penalty clauses, official signature block, and a strict {noticeDeadlineDays}-day reply window.
+                </div>
+
+                <div className="flex gap-2 pt-1">
+                  <button
+                    onClick={() => setShowNoticeModal(false)}
+                    className="flex-1 bg-gray-100 hover:bg-gray-200 text-gray-700 font-bold py-2.5 rounded-xl text-sm"
+                  >
+                    Cancel
+                  </button>
+                  <button
+                    onClick={handleSendNotice}
+                    disabled={noticeSending}
+                    data-testid="send-notice-submit-btn"
+                    className="flex-1 bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 rounded-xl text-sm flex items-center justify-center gap-2 disabled:opacity-50"
+                  >
+                    {noticeSending ? (
+                      <>
+                        <span className="material-symbols-outlined animate-spin text-base">progress_activity</span>
+                        <span>Dispatching...</span>
+                      </>
+                    ) : (
+                      <>
+                        <span className="material-symbols-outlined text-base">send</span>
+                        <span>Serve Notice Now</span>
+                      </>
+                    )}
+                  </button>
+                </div>
+              </>
+            )}
           </div>
         </div>
       )}
