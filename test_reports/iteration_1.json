@@ -1,0 +1,57 @@
+{
+  "summary": "Comprehensive backend-only API testing of the Legal Metrology Compliance Checker. Created a pytest suite (50 tests) covering auth (all 4 seeded roles, /auth/me, cookies, invalid tokens, sessions, logout), Gemini 3 Flash /scan/analyze with real JPEG images, /scan/save persistence + recompute, /scans list & all filters, scan actions, PDF/DOCX/JSON/CSV reports, dashboard stats, hotspots, rules library (12 rules + RBAC), audit logs, user management RBAC, plus unit tests of the Rule 6 engine and Table-II brackets. Result: 47 passed, 1 failed (real 500 crash), 2 xfailed (documented gaps).",
+  "backend_issues": {
+    "critical": [
+      {"endpoint": "POST /api/scan/analyze", "issue": "500 Internal Server Error: \"'>=' not supported between instances of 'NoneType' and 'float'\" when Gemini returns null for measured_numeral_height_mm / measured_letter_height_mm (happens with real product photos where font height cannot be measured). Root cause: server.py L322-323 use extracted.get('measured_numeral_height_mm', 2.4) — the default is NOT applied when the key exists with a null value, so None reaches evaluate_table_ii_font_size(). Fix: `numeral_h = extracted.get('measured_numeral_height_mm') or 2.4` (same for letter_h and estimated_panel_area_sq_cm). Reproduced consistently with /app/backend/tests/assets/product_photo.jpg.", "priority": "CRITICAL"},
+      {"endpoint": "POST /api/scan/analyze", "issue": "Silent fabricated-data fallback: any AI failure or invalid/garbage image returns HTTP 200 with hardcoded mock declarations (ai_vision_service.generate_heuristic_label_analysis -> 'Heritage Consumer Products Ltd.', MRP 140, batch BATCH-MH-2026-89) yielding compliance_status='Compliant', score=100. Verified: posting 'not-a-real-base64-image!!!' returns engine_used='Heuristic OCR & Rule Extractor (Fallback)' with a fully compliant fake case that can then be saved and exported as a statutory report. This is fabricated enforcement evidence and must fail loudly (4xx/5xx) instead.", "priority": "CRITICAL"}
+    ],
+    "minor": [
+      {"endpoint": "ai_vision_service.py L76", "issue": "Hardcoded fallback API key literal `os.environ.get('EMERGENT_LLM_KEY', 'sk-emergent-35f0b804b6bD31a0fB')` — secrets must come from env only, with fail-fast if missing."},
+      {"endpoint": "auth_service.py L14", "issue": "Hardcoded JWT_SECRET default in code (env key exists in .env). Remove the default so misconfiguration fails fast."},
+      {"endpoint": "POST /api/auth/login", "issue": "No brute-force protection / account lockout: 6 consecutive wrong passwords all return 401 with no throttling (xfail-documented)."},
+      {"endpoint": "POST /api/scans/{id}/action", "issue": "Unknown action values (e.g. 'bogus_action') return 200 and only bump updated_at instead of 400/422 validation error."},
+      {"endpoint": "POST /api/scan/analyze, /scan/save, /scans, /dashboard/stats, /reports/*", "issue": "These endpoints are fully unauthenticated (get_current_user_optional / no dependency). Any anonymous caller can create, list, and export inspection cases and download statutory PDF reports. Deliberate? For an enforcement system this should require auth."},
+      {"endpoint": "GET /api/auth/me", "issue": "FIXED BY TESTER: was leaking raw Mongo `_id` in the payload; auth_service now sets only `id` (user['id'] = str(user.pop('_id')))."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_health_auth.py",
+    "/app/backend/tests/test_scans.py",
+    "/app/backend/tests/test_reports_dashboard.py",
+    "/app/backend/tests/test_compliance_engine.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "CRITICAL: Fix NoneType crash in server.py /scan/analyze (coerce null numeral/letter heights and panel area with `or` defaults before compliance evaluation).",
+    "CRITICAL: Remove/gate the hardcoded heuristic mock fallback in ai_vision_service.py — return 502/500 with a clear message when Gemini fails, and never return fabricated compliant declarations. At minimum, mark such results clearly as unusable and block saving/report export.",
+    "Remove hardcoded EMERGENT_LLM_KEY and JWT_SECRET literals; read from env only.",
+    "Validate ScanActionRequest.action against the allowed enum (400 on unknown action).",
+    "Decide on auth requirements for /scan/analyze, /scan/save, /scans, /dashboard/stats and /reports/* (currently public).",
+    "Consider login lockout/rate limiting after 5 failed attempts."
+  ],
+  "critical_code_review_comments": [
+    "server.py: `extracted.get(key, default)` is unsafe against LLM JSON nulls — use a null-coalescing helper for every numeric field taken from the model output (same class of bug as the previously fixed _s() strip issue).",
+    "ai_vision_service.py: the 'fallback' returns a fixed compliant dataset. In a legal-enforcement product this silently manufactures evidence; it also hides AI outages from monitoring since the endpoint keeps returning 200.",
+    "Compliance engine flags missing USP unconditionally (Rule 6(1)(da) applies mainly to multi-unit packs) — the inline comment says 'if net quantity is more than 1 unit/g/ml' but no such condition is implemented; may create false violations.",
+    "server.py is ~740 lines with all routers inline; consider splitting into routers/ modules (auth, scans, reports, analytics).",
+    "Rules/users/reports endpoints correctly project out `_id`; keep that discipline for any new collection reads."
+  ],
+  "updated_files": [
+    "/app/backend/auth_service.py (excluded Mongo _id from /auth/me payload)",
+    "/app/backend/tests/conftest.py (new)",
+    "/app/backend/tests/test_health_auth.py (new)",
+    "/app/backend/tests/test_scans.py (new)",
+    "/app/backend/tests/test_reports_dashboard.py (new)",
+    "/app/backend/tests/test_compliance_engine.py (new)",
+    "/app/backend/tests/assets/label_synthetic.jpg, product_photo.jpg (test images)"
+  ],
+  "success_rate": {"backend": "94% (47/50 assertions-suites passing; 1 hard failure, 2 documented xfails)", "frontend": "not tested (backend-only round)"},
+  "seed_data_creation": "Test scan cases prefixed TEST_ (TEST_Shuddh Bharat Atta, TEST_Violation Brand, TEST_Update Brand, TEST_Action Brand, TEST_Report Brand) created via /api/scan/save and deleted in module/class teardown. Two test images stored under /app/backend/tests/assets.",
+  "should_call_test_agent_after_fix": true,
+  "should_main_agent_self_test": false,
+  "test_credentials": "All 4 accounts in /app/memory/test_credentials.md verified working (bcrypt hashes are $2b$12$; login returns HttpOnly access_token/refresh_token cookies + Bearer token; roles correct).",
+  "context_for_next_testing_agent": "Backend suite lives in /app/backend/tests (conftest + 4 test modules) and runs against REACT_APP_BACKEND_URL. Run: cd /app/backend && python -m pytest tests/ -q. Verified working: all auth flows/roles, /auth/me (after _id fix), sessions, logout, scan save/update/get/list with search+category+status+jurisdiction filters, 4 scan actions with persistence, PDF (%PDF, >1KB), DOCX (PK zip), JSON, CSV export, dashboard stats, 6 hotspots, 12 rules + Table-II reference + rule update RBAC (viewer 403), audit logs (USER_LOGIN present), user list RBAC, and the full Rule 6 / Table-II engine unit tests (non-SI units, post-dated mfg, missing PIN/USP/consumer care/country/batch, font thresholds, score weighting). Outstanding: /scan/analyze 500 on null font heights (test_analyze_real_product_photo) and the mock fallback (xfail). Gemini 3 Flash confirmed live: engine_used='Google Gemini 3 Flash Multimodal Vision' and it extracted real label text from label_synthetic.jpg. Frontend untested.",
+  "rca_of_the_issue": "1) /api/scan/analyze crash: Gemini 3 Flash returns JSON with explicit nulls for measured_numeral_height_mm/measured_letter_height_mm on photos where text height is not determinable; dict.get(key, default) returns None for present-but-null keys, so None is passed into evaluate_table_ii_font_size() where `numeral_height_mm >= min_numeral_req` raises TypeError, surfaced as HTTP 500. Repro: POST /api/scan/analyze with base64 of /app/backend/tests/assets/product_photo.jpg. Mitigation: null-coalesce numeric LLM fields. 2) Mock fallback: any exception in scan_label_with_ai_vision is swallowed and generate_heuristic_label_analysis() returns a static compliant dataset, so invalid images yield score=100 'Compliant' cases."
+}

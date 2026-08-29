@@ -1,0 +1,43 @@
+{
+  "summary": "Re-verified the 3 CRITICAL fixes from iteration_1 plus a full regression run of the existing pytest suite against REACT_APP_BACKEND_URL. Result: 50 passed, 1 xfailed (known no-brute-force-lockout). (1) /api/scan/analyze with a real product photo now returns 200 (Gemini 3 Flash live, engine_used='Google Gemini 3 Flash Multimodal Vision', compliance_status='Non-Compliant', score 0, 9 violations) - the NoneType crash is gone; null measured heights are null-coalesced to 2.4/1.6. (2) Garbage base64 now returns HTTP 502 (FastAPI JSON detail: 'Vision AI extraction failed: ... Base64 decoding failed') and NO fabricated 'Heritage Consumer Products Ltd.' mock; grep confirms generate_heuristic_label_analysis and the hardcoded mock are fully removed from the codebase. A random non-label image also returns a real Gemini evaluation with no Fallback engine. (3) POST /api/scans/{id}/action with 'bogus_action' now returns 400 with the full allowed-action list and does not mutate state; all 4 valid actions (issue_notice/mark_verified/flag_lab_test/archive) still work and persist. (4) auth_service.get_jwt_secret() raises when env missing - no literal default; backend boots (JWT_SECRET present in .env). (5) ai_vision_service reads EMERGENT_LLM_KEY from env only and raises RuntimeError if absent - no 'sk-emergent-...' literal anywhere. Regression: all 4 role logins, /auth/me, sessions, logout, scan save/update/get/list+filters, PDF/DOCX/JSON/CSV exports, dashboard stats, hotspots, rules library RBAC, audit logs and Rule 6/Table-II engine unit tests all pass.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "POST /api/scan/analyze", "issue": "HTTP 502 is intercepted by the Cloudflare/ingress layer: the public URL returns a Cloudflare 'Bad gateway' HTML page (Content-Type text/html, Retry-After: 60) instead of the FastAPI JSON {'detail': ...}. Verified locally on :8001 the JSON detail is correct. Net effect: the frontend cannot show the AI error message and may look like the app is down. Recommend using 422 (or 400) with a machine-readable error code for AI extraction failures instead of 502."},
+      {"endpoint": "POST /api/scan/analyze", "issue": "When Gemini returns null measured_numeral_height_mm/measured_letter_height_mm, defaults 2.4/1.6 are substituted, which are ABOVE the Table-II thresholds - so an unmeasurable label silently passes the font-size check (is_compliant: true, false negative). Consider marking the font check as 'Not Determinable / Manual Verification Required' instead of assuming a passing value."},
+      {"endpoint": "POST /api/auth/login", "issue": "Still no brute-force protection/lockout: 6 consecutive wrong passwords all return 401 with no throttling (xfail-documented)."},
+      {"endpoint": "/api/scan/analyze, /scan/save, /scans, /dashboard/stats, /reports/*", "issue": "Still fully unauthenticated - anonymous callers can create/list/export inspection cases and download statutory PDFs. Pre-existing, unaddressed from iteration_1."}
+    ]
+  },
+  "frontend_issues": {"ui_bugs": [], "integration_issues": [], "design_issues": []},
+  "test_report_links": [
+    "/app/backend/tests/conftest.py",
+    "/app/backend/tests/test_scans.py",
+    "/app/backend/tests/test_health_auth.py",
+    "/app/backend/tests/test_reports_dashboard.py",
+    "/app/backend/tests/test_compliance_engine.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Change the AI-failure status code from 502 to 4xx (e.g. 422) so the error JSON survives the Cloudflare ingress and the UI can display a real message; also verify the frontend gracefully handles a non-JSON error body.",
+    "Do not substitute passing default font heights (2.4/1.6) when the model returns null - surface 'Not Determinable' in table_ii_font_check.",
+    "Optional/pre-existing: add auth to scan/report/dashboard endpoints and login rate limiting."
+  ],
+  "critical_code_review_comments": [
+    "server.py L326-328: null-coalescing fix is correct, but defaults chosen are compliance-passing values; prefer an explicit 'undetermined' state to avoid masking Table-II violations.",
+    "ai_vision_service.py: good - RuntimeError raised, key from env, mock generator deleted. Consider distinguishing user-input errors (bad base64/unreadable image -> 400/422) from upstream provider outages (-> 503) rather than a single 502.",
+    "server.py remains ~753 lines with all routers inline; splitting into routers/ modules is still recommended."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_scans.py (invalid-base64 test now asserts 502 + no fabricated data; new non-label-image test; unknown-action test now asserts 400 + allowed list)",
+    "/app/backend/tests/conftest.py (added non_label_image_b64 fixture)",
+    "/app/backend/tests/assets/non_label.jpg (new synthetic non-label image)"
+  ],
+  "success_rate": {"backend": "100% (50 passed, 1 xfailed - known missing login lockout)", "frontend": "not tested (backend-only round)"},
+  "seed_data_creation": "TEST_-prefixed scan cases created via /api/scan/save and deleted in module teardown; no residual test data expected.",
+  "should_call_test_agent_after_fix": false,
+  "should_main_agent_self_test": true,
+  "test_credentials": "All 4 accounts from /app/memory/test_credentials.md verified working (bcrypt $2b$, HttpOnly access/refresh cookies + Bearer token, correct roles).",
+  "context_for_next_testing_agent": "All 3 critical iteration_1 bugs are fixed and verified. Suite: cd /app/backend && python -m pytest tests/ -q (50 pass, 1 xfail). Remaining known gaps: 502 body masked by Cloudflare (use 4xx), passing default font heights on null measurements, no login lockout, public scan/report/dashboard endpoints. Frontend has never been tested - a frontend round is the logical next step, especially the UI's handling of the new 502 (non-JSON) analyze error.",
+  "rca_of_the_issue": "iteration_1 crash root cause (dict.get default not applied to present-but-null LLM fields) is fixed via `or` coalescing; fabricated-data root cause (swallowed exception -> static heuristic dataset) is fixed by raising RuntimeError and mapping to HTTPException 502. The only new finding is infrastructural: Cloudflare replaces 5xx response bodies with its own HTML page, so the informative JSON detail is lost on the public URL."
+}
